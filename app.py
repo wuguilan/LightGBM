@@ -1,177 +1,156 @@
 import streamlit as st
-import joblib
 import pandas as pd
+import joblib
+import lightgbm  # 必须导入以确保joblib能正确加载LGBM模型
 import shap
 import matplotlib.pyplot as plt
-import lightgbm as lgb  # 导入 lightgbm
-import numpy as np
 
-# --- 1. 页面基础设置 ---
-# set_page_config() 必须是第一个 Streamlit 命令
-st.set_page_config(layout="wide")
-st.title("🏥 脓毒症患者多重风险分层工具")
-st.markdown("""
-**使用LightGBM模型对使用肝素类药物的脓毒症患者进行 血栓、出血及死亡 的风险分层**  
-*请在下方输入患者的临床参数，然后点击“评估风险等级”按钮。*
-""")
+# --- 页面基础配置 ---
+st.set_page_config(
+    page_title="VTE风险预测与解释系统(Alfafa-sepsis-vte)",
+    page_icon="🩸",
+    layout="wide"
+)
 
+# --- 模型加载 ---
+@st.cache_resource  # 使用缓存，避免每次都重新加载模型
+def load_model(path):
+    """加载 .joblib 格式的模型"""
+    try:
+        model = joblib.load(path)
+        return model
+    except FileNotFoundError:
+        st.error(f"错误：模型文件 '{path}' 未找到。")
+        st.error(f"请确保 '{path}' 文件与您的Streamlit应用在同一个目录下。")
+        return None
+    except Exception as e:
+        st.error(f"加载模型时发生未知错误: {e}")
+        return None
 
-# --- 2. 加载模型和特征 ---
-# 使用 st.cache_resource 来缓存加载的模型，提高效率
-@st.cache_resource
-def load_model():
-    # 加载最终的LightGBM多分类模型
-    pipeline = joblib.load("final_risk_stratification_model.joblib")
-    # 从Pipeline中提取模型本身，用于SHAP分析
-    model = pipeline.named_steps['model']
-    # 定义新模型的特征名称
-    feature_names = ['septic_shock', 'acutephysiologyscore', 'bleed_history', 'heart_failure', 'respiratory_failure',
-                     'acs', 'hypertension', 'albumin_max', 'bun_max', 'bilirubin_max', 'creatinine_max']
-    return pipeline, model, feature_names
+# 加载您训练好的LightGBM模型
+lgbm_model = load_model('LightGBM.joblib')
 
+# --- 特征定义 ---
+# 定义模型训练时使用的完整特征列
+FEATURE_COLUMNS = [
+    "vte_history", "cancer", "respiratory_failure", "heart_failure", "albumin_max",
+    "creatinine_max", "inr_min", "pt_min", "alt_max", "fresh_frozen_plasma_input",
+    "platelets_input", "rbw_input", "vasopressin", "sedative", "cvc"
+]
 
-# 执行加载
-pipeline, model, feature_names = load_model()
+# 将特征分为数值型和二元（是/否）型
+NUMERIC_FEATURES = [
+    "albumin_max", "creatinine_max", "inr_min", "pt_min", "alt_max",
+    "fresh_frozen_plasma_input", "platelets_input", "rbw_input"
+]
+BINARY_FEATURES = [
+    "vte_history", "cancer", "respiratory_failure", "heart_failure",
+    "vasopressin", "sedative", "cvc"
+]
 
-# --- 3. 初始化SHAP解释器 ---
-# SHAP需要模型本身，而不是整个pipeline
-explainer = shap.TreeExplainer(model)
-
-
-# --- 4. 定义用户输入界面 ---
-def user_input_features():
-    st.header("患者临床参数输入")
-    col1, col2, col3 = st.columns(3)
-
-    # 重新组织输入项以匹配新模型的11个特征
-    with col1:
-        septic_shock = st.selectbox("是否为感染性休克 (Septic Shock)", ["否", "是"], index=0)
-        acutephysiologyscore = st.number_input("急性生理学评分 (APACHE II/SOFA)", min_value=0, max_value=100, value=15)
-        bleed_history = st.selectbox("是否有出血史 (Bleed History)", ["否", "是"], index=0)
-        heart_failure = st.selectbox("是否有心力衰竭 (Heart Failure)", ["否", "是"], index=0)
-
-    with col2:
-        respiratory_failure = st.selectbox("是否有呼吸衰竭 (Respiratory Failure)", ["否", "是"], index=0)
-        acs = st.selectbox("是否有急性冠脉综合征 (ACS)", ["否", "是"], index=0)
-        hypertension = st.selectbox("是否有高血压 (Hypertension)", ["否", "是"], index=0)
-        albumin_max = st.number_input("最大白蛋白 (g/L)", min_value=10.0, max_value=60.0, value=35.0, step=0.1)
-
-    with col3:
-        bun_max = st.number_input("最大尿素氮 (BUN, mg/dL)", min_value=5, max_value=150, value=20)
-        bilirubin_max = st.number_input("最大胆红素 (mg/dL)", min_value=0.1, max_value=20.0, value=1.0, step=0.1)
-        creatinine_max = st.number_input("最大肌酐 (mg/dL)", min_value=0.3, max_value=15.0, value=1.2, step=0.1)
-
-    # 将用户输入转换为模型需要的DataFrame格式
-    data = {
-        'septic_shock': 1 if septic_shock == "是" else 0,
-        'acutephysiologyscore': acutephysiologyscore,
-        'bleed_history': 1 if bleed_history == "是" else 0,
-        'heart_failure': 1 if heart_failure == "是" else 0,
-        'respiratory_failure': 1 if respiratory_failure == "是" else 0,
-        'acs': 1 if acs == "是" else 0,
-        'hypertension': 1 if hypertension == "是" else 0,
-        'albumin_max': albumin_max,
-        'bun_max': bun_max,
-        'bilirubin_max': bilirubin_max,
-        'creatinine_max': creatinine_max
-    }
-
-    # 确保列的顺序与训练时一致
-    return pd.DataFrame([data], columns=feature_names)
+# --- 【新增】为数值特征设置默认值 ---
+# 您可以根据实际情况（如特征的平均值、中位数或临床正常值）修改这些默认值
+DEFAULT_VALUES = {
+    "albumin_max": 2.4,
+    "creatinine_max": 1.6,
+    "inr_min": 1.1,
+    "pt_min": 12.7,
+    "alt_max": 46.0,
+    "fresh_frozen_plasma_input": 0.0,
+    "platelets_input": 0.0,
+    "rbw_input": 0.0
+}
 
 
-# --- 5. 主函数：运行整个应用 ---
-def main():
-    # 获取用户输入
-    input_df = user_input_features()
+# --- 页面标题 ---
+st.title("🩸 基于LightGBM的VTE事件风险预测系统(Alfafa-sepsis-vte)")
+st.markdown("---")
 
-    if st.button("评估风险等级"):
-        try:
-            # --- 核心预测逻辑 ---
-            # 使用完整的pipeline进行预测，它会自动处理标准化
-            prediction_class = pipeline.predict(input_df)[0]
-            prediction_proba = pipeline.predict_proba(input_df)[0]
+# --- 用户输入界面 ---
+if lgbm_model:
+    with st.expander("点击此处输入/修改患者指标", expanded=True):
+        input_data = {}
 
-            # 定义风险等级的名称和颜色
-            risk_labels = {0: "低风险", 1: "中风险", 2: "高风险"}
-            risk_colors = {0: "green", 1: "orange", 2: "red"}
+        with st.form("vte_input_form"):
+            st.subheader("数值指标")
+            num_cols = st.columns(4)
+            for i, feature in enumerate(NUMERIC_FEATURES):
+                with num_cols[i % 4]:
+                    # 【修改】使用 st.number_input 的 value 参数设置默认值
+                    input_data[feature] = st.number_input(
+                        label=feature,
+                        step=1.0,
+                        format="%.2f",
+                        value=DEFAULT_VALUES.get(feature, 0.0) # 从字典获取默认值
+                    )
 
-            # --- 结果展示 ---
-            st.success("风险评估完成！")
+            st.markdown("<br>", unsafe_allow_html=True)
 
-            # 使用st.metric来突出显示结果
-            st.metric(
-                label="综合风险等级",
-                value=risk_labels[prediction_class]
-            )
-            st.write(
-                f"模型判定该患者属于 **<span style='color:{risk_colors[prediction_class]};'>{risk_labels[prediction_class]}</span>**。",
-                unsafe_allow_html=True)
+            st.subheader("二元指标 (是/否)")
+            bin_cols = st.columns(4)
+            for i, feature in enumerate(BINARY_FEATURES):
+                with bin_cols[i % 4]:
+                     # 【修改】为radio设置默认值'否' (index=0)
+                    value = st.radio(
+                        label=feature,
+                        options=['否', '是'],
+                        key=f"radio_{feature}",
+                        horizontal=True,
+                        index=0
+                    )
+                    input_data[feature] = 1 if value == '是' else 0
 
-            # 显示每个类别的具体概率
-            st.subheader("各风险等级概率")
-            probabilities_df = pd.DataFrame({
-                '风险等级': [risk_labels[i] for i in range(len(prediction_proba))],
-                '概率': [f"{p * 100:.1f}%" for p in prediction_proba]
-            })
-            st.table(probabilities_df)
+            submitted = st.form_submit_button("执行VTE风险预测")
 
-            # --- SHAP 可解释性分析 ---
-            # --- SHAP 可解释性分析 ---
-            scaled_input = pipeline.named_steps['scaler'].transform(input_df)
+    # --- 预测和结果展示 ---
+    if submitted:
+        st.header("📊 预测结果与个体化解释")
 
-            scaled_input_df = pd.DataFrame(
-                scaled_input,
-                columns=feature_names
-            )
+        input_df = pd.DataFrame([input_data])
+        input_df = input_df[FEATURE_COLUMNS]
 
-            shap_values = explainer(scaled_input_df)
+        prediction_proba = lgbm_model.predict_proba(input_df)[:, 1][0]
 
-            st.subheader("个体化风险归因分析 (SHAP)")
-            st.markdown("""
-            下图展示了哪些因素对当前病人的风险等级判断贡献最大：
-            - **红色**：推高风险
-            - **蓝色**：降低风险
-            """)
+        risk_level, risk_color = "", ""
+        if prediction_proba <= 0.0078:
+            risk_level, risk_color = "低风险", "green"
+        elif 0.0078 < prediction_proba <= 0.0294:
+            risk_level, risk_color = "中风险", "orange"
+        else:
+            risk_level, risk_color = "高风险", "red"
 
-            st.write(f"**对预测结果 “{risk_labels[prediction_class]}” 的归因分析:**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric(label="VTE事件预测概率", value=f"{prediction_proba:.4%}")
+        with col2:
+            st.markdown(f"### 风险等级: <font color='{risk_color}'>**{risk_level}**</font>", unsafe_allow_html=True)
 
-            fig, ax = plt.subplots()
-            shap.plots.waterfall(
-                shap_values[0, :, prediction_class],
-                max_display=10,
-                show=False
-            )
-            st.pyplot(fig)
+        st.markdown("---")
 
+        st.subheader("个体化预测归因 (SHAP Waterfall)")
+        st.markdown(
+            "下图解释了每个特征如何将预测概率从基线值（`base value`）推向最终的输出值。"
+            "**红色**的特征是增加风险的因素，**蓝色**的特征是降低风险的因素。"
+        )
+        # 创建SHAP解释器并计算SHAP值
+        explainer = shap.TreeExplainer(lgbm_model)
+        shap_values = explainer.shap_values(input_df)
 
-        except Exception as e:
-            st.error(f"在预测过程中发生错误: {str(e)}")
+        shap.plots.waterfall(
+            shap.Explanation(
+                values=shap_values[0],
+                base_values=explainer.expected_value,
+                data=input_df.iloc[0],
+                feature_names=input_df.columns
+            ),
+            show=False
+        )
 
+        st.pyplot(plt.gcf())
 
-# --- 6. 侧边栏信息 ---
-with st.sidebar:
-    st.header("关于此工具")
-    st.markdown("""
-    - **模型类型**: LightGBM 多分类器
-    - **基础模型**: 由两个复杂的Stacking集成模型蒸馏而来
-    - **预测目标**: 脓毒症患者的综合风险等级（低、中、高）
-    - **训练数据**: 来自多中心的ICU脓毒症患者数据
-    """)
+        with st.expander("查看本次输入的详细信息"):
+            st.dataframe(input_df.style.highlight_max(axis=1))
 
-    st.header("使用说明")
-    st.markdown("""
-    1. 在主界面输入患者的11项临床指标。
-    2. 点击“评估风险等级”按钮。
-    3. 查看模型给出的风险等级、概率及SHAP归因分析。
-    """)
-
-    st.warning("""
-    **临床决策声明**  
-    本工具的预测结果仅供参考，不能替代执业医师的临床判断。所有医疗决策都应基于对患者具体情况的全面评估。
-    """)
-
-# --- 运行主程序 ---
-if __name__ == '__main__':
-    main()
+else:
+    st.warning("模型未能加载，应用无法运行。请检查 'LightGBM.joblib' 文件是否存在。")
 
